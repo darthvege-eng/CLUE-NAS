@@ -340,22 +340,7 @@ class PositionalEmbedding(tf.Module):
         embedded_positions=self._pstn_embd(positions)
         proj_out=self._proj(input_ts)
         return proj_out+embedded_positions
-    
-class FixedPositionalEmbedding(tf.keras.layers.Layer):
-    def __init__(self,name="pstnembd"):
-        super(FixedPositionalEmbedding,self).__init__(name=name)
-        self._name=name
-    def build(self,in_shape):
-        _,seq_len,dims=in_shape
-        positions=tf.range(seq_len,dtype=tf.float32)
-        scale=1.0/seq_len
-        positions=tf.expand_dims(positions,axis=-1)*scale
-        fix_pstn_embbd=tf.tile(positions,[1,dims])
-        self._fix_pstn_embbd=tf.constant(fix_pstn_embbd,dtype=tf.float32)
-        return
-    def call(self,input_ts):
-        return input_ts+self._fix_pstn_embbd
-    
+
 class Transformer(tf.Module):
     def __init__(self,num_heads,embed_len,name="transformer"):
         super(Transformer,self).__init__(name=name)

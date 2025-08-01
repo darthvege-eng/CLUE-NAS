@@ -1,8 +1,36 @@
 import tensorflow as tf
 import numpy as np
-from modules import DenseBN,FixedPositionalEmbedding,gelu
+from modules import DenseBN,gelu
 from nas_prcss import CellPth2Cell
-from json_io import Dict2JSON
+from json_io import Dict2JSON,JSON2Dict
+
+class CLIPFixedPositionalEmbedding(tf.keras.layers.Layer):
+    def __init__(self,embds_js_path="clip_fixed_pstn_embd.json",name="clippstnembd"):
+        super(CLIPFixedPositionalEmbedding,self).__init__(name=name)
+        rank_embds=JSON2Dict(embds_js_path)["rank_embds"]
+        context_embds=JSON2Dict(embds_js_path)["context_embds"]
+        self._fix_pstn_embbd=np.array(rank_embds)+np.array(context_embds)
+        self._name=name
+    def build(self,in_shape):
+        self._fix_pstn_embbd=tf.constant(self._fix_pstn_embbd,dtype=tf.float32)
+        return
+    def call(self,input_ts):
+        return input_ts+self._fix_pstn_embbd
+    
+class FixedPositionalEmbedding(tf.keras.layers.Layer):
+    def __init__(self,name="pstnembd"):
+        super(FixedPositionalEmbedding,self).__init__(name=name)
+        self._name=name
+    def build(self,in_shape):
+        _,seq_len,dims=in_shape
+        positions=tf.range(seq_len,dtype=tf.float32)
+        scale=1.0/seq_len
+        positions=tf.expand_dims(positions,axis=-1)*scale
+        fix_pstn_embbd=tf.tile(positions,[1,dims])
+        self._fix_pstn_embbd=tf.constant(fix_pstn_embbd,dtype=tf.float32)
+        return
+    def call(self,input_ts):
+        return input_ts+self._fix_pstn_embbd
 
 class ArchsEncoder(tf.Module):
     def __init__(self,name="archsencoder"):
@@ -38,6 +66,7 @@ class ContextAlignment(tf.Module):
         self._Build()
     @tf.Module.with_name_scope
     def _Build(self):
+        # self._pstnembd=CLIPFixedPositionalEmbedding(name=self._name+"_pstnembd")
         self._pstnembd=FixedPositionalEmbedding(name=self._name+"_pstnembd")
         self._fc1=DenseBN(128,activation=None,name=self._name+"_fc1")
         self._fc2=DenseBN(128,activation=None,name=self._name+"_fc2")
@@ -56,10 +85,10 @@ class ContextAlignment(tf.Module):
         return sims,embds_dist
     @tf.Module.with_name_scope
     def __call__(self,input_ts):
-        archs_embd,context_embd,cnfd_embds=input_ts
+        archs_embd,context_embd=input_ts
         context_embd=tf.expand_dims(context_embd,axis=-2)
-        context_embds=tf.tile(context_embd,[1,tf.shape(cnfd_embds)[-2],1])
-        context_embds=cnfd_embds+context_embds
+        context_embds=tf.tile(context_embd,[1,5,1]) #copy m=5
+        context_embds=self._pstnembd(context_embds)
         embds_sims,embds_dist=self._Sim(context_embds,archs_embd)
         max_sim=tf.reduce_max(embds_sims,axis=-1,keepdims=True)
         chosen_mask=tf.cast(embds_sims>=max_sim,tf.float32)
@@ -90,9 +119,9 @@ class CLUENAS(tf.Module):
         self._offset=DenseBN(self._anchors_len,activation=tf.nn.sigmoid,use_bn=False,name=self._name+"_offset")
     @tf.Module.with_name_scope
     def __call__(self,input_ts):
-        info_flow,metrics,context_embd,cnfd_embds=input_ts
+        info_flow,metrics,context_embd=input_ts
         archs_embd=self._archencoder([info_flow,metrics])
-        concat_embd,embds_sims,embds_dist=self._contextalignment([archs_embd,context_embd,cnfd_embds])
+        concat_embd,embds_sims,embds_dist=self._contextalignment([archs_embd,context_embd])
         fused_embd=self._fc1(concat_embd)
         fused_embd=self._fc2(fused_embd)
         pred_offset=self._offset(fused_embd)
@@ -138,23 +167,20 @@ def CreateCLUENAS(acc_anchors):
     info_flow=tf.keras.Input(shape=(320))
     metrics=tf.keras.Input(shape=(128))
     context_embd=tf.keras.Input(shape=(1024))
-    rank_embds_in=tf.keras.Input(shape=(len(acc_anchors),1024))
-    context_embds_in=tf.keras.Input(shape=(len(acc_anchors),1024))
-    cnfd_embds=rank_embds_in+context_embds_in
-    _,preds=CLUENAS(acc_anchors)([info_flow,metrics,context_embd,cnfd_embds])
-    model=tf.keras.Model(inputs=[info_flow,metrics,context_embd,rank_embds_in,context_embds_in],outputs=preds)
+    _,preds=CLUENAS(acc_anchors)([info_flow,metrics,context_embd])
+    model=tf.keras.Model(inputs=[info_flow,metrics,context_embd],outputs=preds)
     return model
 
 def CompileCLUENAS(model,lr=0.01):
     model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=lr),loss=CLUELoss()())
     return model
 
-def CLUENASPredictCellPth(model,rank_embds,context_embds,cell_pth):
+def CLUENASPredictCellPth(model,cell_pth):
     cell=CellPth2Cell(cell_pth,True)
     adj_mat=np.array(cell["adj_matrix"])
     ops_mat=np.array(cell["operations"])
     ctxt_tkn=np.array(cell["ctxt_embds"])
-    preds=model.predict_on_batch((np.array([adj_mat]),np.array([ops_mat]),np.array([ctxt_tkn]),np.array([rank_embds]),np.array([context_embds])))
+    preds=model.predict_on_batch((np.array([adj_mat]),np.array([ops_mat]),np.array([ctxt_tkn])))
     pred_sims=preds[0][0]
     pred_accs=preds[0][-1]
     max_sim_idx=np.argmax(pred_sims)
@@ -164,105 +190,7 @@ def CLUENASPredictCellPth(model,rank_embds,context_embds,cell_pth):
     Dict2JSON(cell,cell_pth)
     return pred_acc
 
-def CLUENASPredictCellPths(model,rank_embds,context_embds,cell_pths):
+def CLUENASPredictCellPths(model,cell_pths):
     for i,cell_pth in enumerate(cell_pths):
-        CLUENASPredictCellPth(model,rank_embds,context_embds,cell_pth)
+        CLUENASPredictCellPth(model,cell_pth)
     return 
-
-def CreateCLUENASforEmbd(acc_anchors,whts_path=None):
-    info_flow=tf.keras.Input(shape=(320))
-    metrics=tf.keras.Input(shape=(128))
-    context_embd=tf.keras.Input(shape=(1024))
-    rank_embds_in=tf.keras.Input(shape=(len(acc_anchors),1024))
-    context_embds_in=tf.keras.Input(shape=(len(acc_anchors),1024))
-    cnfd_embds=rank_embds_in+context_embds_in
-    embds,preds=CLUENAS(acc_anchors)([info_flow,metrics,context_embd,cnfd_embds])
-    model=tf.keras.Model(inputs=[info_flow,metrics,context_embd,rank_embds_in,context_embds_in],outputs=embds)
-    _model=tf.keras.Model(inputs=[info_flow,metrics,context_embd,rank_embds_in,context_embds_in],outputs=preds)
-    if(whts_path!=None):
-        _model.load_weights(whts_path)
-    return model
-
-def CLUENASPredictEmbdCellPth(model,rank_embds,context_embds,cell_pth):
-    cell=CellPth2Cell(cell_pth,True)
-    adj_mat=np.array(cell["adj_matrix"])
-    ops_mat=np.array(cell["operations"])
-    ctxt_tkn=np.array(cell["ctxt_embds"])
-    preds=model.predict_on_batch((np.array([adj_mat]),np.array([ops_mat]),np.array([ctxt_tkn]),np.array([rank_embds]),np.array([context_embds])))
-    pred_embds=preds[0].tolist()
-    return pred_embds
-
-def CLUENASPredictEmbdCellPths(model,rank_embds,context_embds,cell_pths):
-    pred_embds_list=[]
-    for i,cell_pth in enumerate(cell_pths):
-        pred_embds=CLUENASPredictEmbdCellPth(model,rank_embds,context_embds,cell_pth)
-        pred_embds_list.append(pred_embds)
-    return pred_embds_list
-
-##############################################
-
-class CLUENASforShap(tf.Module):
-    def __init__(self,acc_anchors,name="cluenasforshap"):
-        super(CLUENASforShap,self).__init__(name=name)
-        self._anchors_len=len(acc_anchors)
-        self._acc_anchors=np.array(acc_anchors)
-        self._acc_bases=self._acc_anchors[...,0]
-        self._scale_vals=self._acc_anchors[...,1]-self._acc_bases
-        self._name=name
-        self._Build()
-    @tf.Module.with_name_scope
-    def _Build(self):
-        self._archencoder=ArchsEncoder(name=self._name+"_archencoder")
-        self._contextalignment=ContextAlignment(name=self._name+"_contextalignment")
-        self._fc1=DenseBN(64,activation=gelu,name=self._name+"_fc1")
-        self._fc2=DenseBN(32,activation=None,name=self._name+"_fc2")
-        self._offset=DenseBN(self._anchors_len,activation=tf.nn.sigmoid,use_bn=False,name=self._name+"_offset")
-    @tf.Module.with_name_scope
-    def __call__(self,input_ts):
-        info_flow,metrics,context_embd,cnfd_embds,concat_embds_in=input_ts
-        archs_embd=self._archencoder([info_flow,metrics])
-        concat_embd,embds_sims,embds_dist=self._contextalignment([archs_embd,context_embd,cnfd_embds])
-        fused_embd=self._fc1(concat_embd)
-        fused_embd=self._fc2(fused_embd)
-        pred_offset=self._offset(fused_embd)
-        pred_acc=self._acc_bases+(pred_offset*self._scale_vals)
-        pred_sims=tf.expand_dims(embds_sims,axis=-2)
-        embds_dist=tf.expand_dims(embds_dist,axis=-2)
-        pred_offset=tf.expand_dims(pred_offset,axis=-2)
-        pred_acc=tf.expand_dims(pred_acc,axis=-2)
-        out_ts=tf.concat([pred_sims,pred_offset,embds_dist,pred_acc],axis=-2)
-        x=self._fc1(concat_embds_in)
-        x=self._fc2(x)
-        shap_out=self._offset(x)
-        # shap_out=self._acc_bases+(x*self._scale_vals)
-        return concat_embd,shap_out,out_ts
-
-def CreateCLUENASBodyforShap(acc_anchors,whts_path=None):
-    info_flow=tf.keras.Input(shape=(320))
-    metrics=tf.keras.Input(shape=(128))
-    concat_in=tf.keras.Input(shape=(256))
-    context_embd=tf.keras.Input(shape=(1024))
-    rank_embds_in=tf.keras.Input(shape=(len(acc_anchors),1024))
-    context_embds_in=tf.keras.Input(shape=(len(acc_anchors),1024))
-    cnfd_embds=rank_embds_in+context_embds_in
-    concat_embd,_,preds=CLUENASforShap(acc_anchors)([info_flow,metrics,context_embd,cnfd_embds,concat_in])
-    model=tf.keras.Model(inputs=[info_flow,metrics,context_embd,rank_embds_in,context_embds_in],outputs=concat_embd)
-    _model=tf.keras.Model(inputs=[info_flow,metrics,context_embd,rank_embds_in,context_embds_in],outputs=preds)
-    if(whts_path!=None):
-        _model.load_weights(whts_path)
-    return model
-
-def CreateCLUENASHeadforShap(acc_anchors,whts_path=None):
-    info_flow=tf.keras.Input(shape=(320))
-    metrics=tf.keras.Input(shape=(128))
-    concat_in=tf.keras.Input(shape=(256))
-    context_embd=tf.keras.Input(shape=(1024))
-    rank_embds_in=tf.keras.Input(shape=(len(acc_anchors),1024))
-    context_embds_in=tf.keras.Input(shape=(len(acc_anchors),1024))
-    cnfd_embds=rank_embds_in+context_embds_in
-    _,shap_out,preds=CLUENASforShap(acc_anchors)([info_flow,metrics,context_embd,cnfd_embds,concat_in])
-    model=tf.keras.Model(inputs=concat_in,outputs=shap_out)
-    _model=tf.keras.Model(inputs=[info_flow,metrics,context_embd,rank_embds_in,context_embds_in],outputs=preds)
-    if(whts_path!=None):
-        _model.load_weights(whts_path)
-    return model

@@ -28,14 +28,12 @@ def CellPths2Psp(cell_pths,gt_key,proxy_key,ignore=True):
     for gt_rank,ranked_cell_pth in enumerate(gt_ranked_cell_pths):
         id=CellPth2Cell(ranked_cell_pth)["id"]
         ranking_dict[id].append(gt_rank)
-
     gt_ranking=[]
     pred_ranking=[]
     for id in ranking_dict:
         pred,gt=ranking_dict[id]
         gt_ranking.append(gt)
         pred_ranking.append(pred)
-    # psp=KandallTauRank(gt_ranking,pred_ranking)
     psp=SpearmanRank(gt_ranking,pred_ranking)
     return psp
 
